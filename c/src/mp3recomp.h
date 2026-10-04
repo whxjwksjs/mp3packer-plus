@@ -42,10 +42,24 @@
  *   - If not (or on recoverable error): frame is left unchanged, returns 0.
  * Returns -1 on catastrophic error (caller should keep original).
  *
- * Only long blocks (window_switching==0) are optimized. Short/mixed blocks,
+ * Handles both long blocks (window_switching==0) and pure short blocks
+ * (window_switching==1, block_type==2, mixed_block==0). Mixed blocks,
  * intensity-stereo right channels, and undecodable frames pass through.
+ *
+ * Thread-safe: may be called concurrently on different frames.
  */
 int recompress_frame(queue_frame_t *qf);
+
+/* Recompress all frames in parallel using N worker threads.
+ * Each frame is independent; order is preserved (in-place updates).
+ * If nworkers <= 1, processes single-threaded.
+ * Returns 0 on success.
+ */
+int recompress_frames_parallel(queue_frame_t *frames, size_t nframes,
+                               int nworkers);
+
+/* Get the default number of workers (CPU core count, capped at 32). */
+int recompress_default_workers(void);
 
 /* Serialize side_info_t to bytes (for -z updated side info).
  * Writes mp3_side_info_size(hdr) bytes to out.

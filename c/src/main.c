@@ -15,6 +15,7 @@ void print_usage(const char *prog) {
     printf("  -r      Minimize bit reservoir\n");
     printf("  -R      Maximize bit reservoir (default)\n");
     printf("  -z      Recompress Huffman data (lossless, slower)\n");
+    printf("  --workers N  Thread count for -z (default: CPU cores)\n");
     printf("  -i      Info only\n");
     printf("  -f      Force overwrite\n");
     printf("  -h      This help\n");
@@ -65,6 +66,8 @@ int main(int argc, char **argv) {
             opts.minimize_reservoir = 0;
         else if (strcmp(argv[i], "-z") == 0)
             opts.recompress = 1;
+        else if (strcmp(argv[i], "--workers") == 0 && i+1 < argc)
+            opts.workers = atoi(argv[++i]);
         else if (strcmp(argv[i], "-i") == 0)
             opts.info_only = 1;
         else if (strcmp(argv[i], "-f") == 0)
@@ -140,6 +143,7 @@ int main(int argc, char **argv) {
     rq.min_bitrate = opts.min_bitrate;
     rq.minimize_reservoir = opts.minimize_reservoir;
     rq.recompress = opts.recompress;
+    rq.workers = opts.workers;
     rq.delete_leading = opts.delete_begin;
     rq.delete_trailing = opts.delete_end;
 

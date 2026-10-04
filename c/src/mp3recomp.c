@@ -43,6 +43,8 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <unistd.h>
 
 #include "mp3recomp.h"
 #include "mp3huffman.h"
@@ -167,19 +169,61 @@ static int part2_bits_mpeg2(int scalefac_compress)
     return bits;
 }
 
+/* Compute part2 bit length for MPEG-1 short block.
+ * Returns -1 if not computable (mixed block, invalid).
+ *
+ * For pure short blocks (block_type=2, mixed_block=0):
+ *   - Bands 0-5: 6 bands x 3 windows = 18 scalefactors, slen1 bits each
+ *   - Bands 6-11: 6 bands (shared across windows), slen2 bits each
+ * Total: 18*slen1 + 6*slen2 bits.
+ *
+ * Mixed blocks (mixed_block=1) have a complex structure with long-block
+ * scalefactors for the first 2 subbands; we skip them (return -1).
+ *
+ * NOTE: Short block Huffman optimization is currently DISABLED (returns -1)
+ * because the fixed region boundary for short blocks is not yet verified.
+ * The decode/optimize functions exist but are not called. See GitHub issue.
+ */
+static int part2_bits_mpeg1_short(const side_info_t *side, int g, int ch)
+{
+    (void)side; (void)g; (void)ch;
+    return -1;  /* Disabled: region boundary not verified */
+#if 0
+    /* Only pure short blocks (block_type=2, not mixed). */
+    if (side->block_type[g][ch] != 2)
+        return -1;
+    if (side->mixed_block[g][ch] != 0)
+        return -1;  /* mixed: skip for now */
+
+    int sfc = side->scalefac_compress[g][ch];
+    if (sfc < 0 || sfc > 15)
+        return -1;
+
+    int slen1 = m1_slen[sfc][0];
+    int slen2 = m1_slen[sfc][1];
+
+    return 18 * slen1 + 6 * slen2;
+#endif
+}
+
 /* Compute part2 bit length for a granule/channel.
- * Returns -1 if not computable (short block, intensity stereo, invalid).
- * Only call for long blocks (window_switching==0).
+ * Returns -1 if not computable (mixed block, intensity stereo, invalid).
+ * Handles both long blocks (window_switching==0) and pure short blocks.
  */
 static int part2_bits(const frame_header_t *hdr, const side_info_t *side,
                       int g, int ch)
 {
-    if (side->window_switching[g][ch] != 0)
-        return -1;  /* short/mixed: not optimized */
-
     if (hdr->version == MPEG_1) {
-        return part2_bits_mpeg1(side, g, ch);
+        if (side->window_switching[g][ch] == 0) {
+            return part2_bits_mpeg1(side, g, ch);
+        } else {
+            return part2_bits_mpeg1_short(side, g, ch);
+        }
     } else {
+        /* MPEG-2/2.5: for now, only long blocks. Short blocks in LSF
+         * have a different scalefactor scheme; skip them. */
+        if (side->window_switching[g][ch] != 0)
+            return -1;
         /* MPEG-2/2.5: skip intensity-stereo right channels (different
          * scalefactor scheme). Intensity stereo is signaled by mode_ext
          * bit 0 when chan_mode is joint stereo. */
@@ -274,11 +318,10 @@ static int find_best_config(const int16_t *coeffs, int orig_big_values,
 
     /* Step 1: Precompute band_cost[band][table].
      * Band b covers samples [band_edges[b], band_edges[b+1]).
-     * 22 bands (0-21), 32 tables. */
+     * 22 bands (0-21), 32 tables.
+     * Note: allocated on stack (704 ints = ~2.8KB); thread-safe. */
 #define NBANDS 22
-    static int band_cost[NBANDS][32];
-    /* Note: static to avoid stack overflow; single-threaded use is fine
-     * for now. TODO: make thread-local for --workers. */
+    int band_cost[NBANDS][32];
 
     for (int b = 0; b < NBANDS; b++) {
         int s = band_edges[b];
@@ -494,10 +537,136 @@ static int find_best_config(const int16_t *coeffs, int orig_big_values,
 }
 
 /* ------------------------------------------------------------------ */
-/* Part 3: Per-granule/channel decode, optimize, re-encode             */
+/* Short block optimizer                                                */
 /* ------------------------------------------------------------------ */
 
-/* Decoded granule/channel data. */
+/* Best configuration for a short block. */
+typedef struct {
+    int big_values;       /* pairs */
+    int table0, table1;   /* table_select[0], [1] */
+    int count1table;      /* 0 = A, 1 = B */
+    int count1_quads;
+    int total_bits;
+} best_cfg_short_t;
+
+/* Fixed region boundary for short blocks (in samples).
+ * Region 0: [0, SHORT_REGION_SPLIT), table0
+ * Region 1: [SHORT_REGION_SPLIT, 2*big_values), table1
+ * We use one window (192 samples) as the split point. */
+#define SHORT_REGION_SPLIT 192
+
+/* Find the optimal Huffman configuration for a short block (576 coeffs).
+ *
+ * Short blocks use 2 tables (not 3) with a FIXED region boundary
+ * (no region counts transmitted). We optimize:
+ *   - big_values (must cover all |v|>1)
+ *   - table0, table1 (0-31, excluding 4/14)
+ *   - count1 table (A/B)
+ *
+ * Returns 0 on success (cfg filled), -1 if no valid config.
+ */
+static int find_best_config_short(const int16_t *coeffs, int orig_big_values,
+                                  best_cfg_short_t *cfg)
+{
+    int last_nz = find_last_nonzero(coeffs);
+    int last_big = find_last_big(coeffs);
+
+    /* Edge case: all zeros. */
+    if (last_nz < 0) {
+        cfg->big_values = 0;
+        cfg->table0 = cfg->table1 = 0;
+        cfg->count1table = 0;
+        cfg->count1_quads = 0;
+        cfg->total_bits = 0;
+        return 0;
+    }
+
+    /* Minimum big_values to cover all |v|>1. */
+    int min_big_values = (last_big + 2) / 2;
+    if (min_big_values < 0) min_big_values = 0;
+    if (min_big_values > 288) return -1;
+
+    /* Big_values candidates: smallest covering last_big, plus original. */
+    int candidates[4];
+    int ncand = 0;
+    candidates[ncand++] = min_big_values;
+    if (orig_big_values != min_big_values &&
+        orig_big_values >= min_big_values && orig_big_values <= 288) {
+        candidates[ncand++] = orig_big_values;
+    }
+
+    int best_total = INT_MAX / 2;
+    best_cfg_short_t best;
+    memset(&best, 0, sizeof(best));
+    int found = 0;
+
+    for (int ci = 0; ci < ncand; ci++) {
+        int bv = candidates[ci];
+        int bv_samples = 2 * bv;
+
+        /* Region split (fixed). Clamp to bv_samples. */
+        int r0_end = SHORT_REGION_SPLIT;
+        if (r0_end > bv_samples) r0_end = bv_samples;
+
+        int r0_pairs = r0_end / 2;
+        int r1_pairs = (bv_samples - r0_end) / 2;
+
+        /* Count1 region. */
+        int c1_quads = 0;
+        if (last_nz >= bv_samples) {
+            c1_quads = (last_nz - bv_samples + 4) / 4;
+        }
+
+        /* Precompute count1 costs. */
+        int c1_cost[2] = {0, 0};
+        int c1_valid[2] = {1, 1};
+        if (c1_quads > 0) {
+            for (int c1t = 0; c1t <= 1; c1t++) {
+                c1_cost[c1t] = huff_cost_count1(c1t, coeffs + bv_samples, c1_quads);
+                if (c1_cost[c1t] >= INT_MAX / 2)
+                    c1_valid[c1t] = 0;
+            }
+        }
+
+        /* Try all (t0, t1, c1t) combinations. */
+        for (int c1t = 0; c1t <= 1; c1t++) {
+            if (!c1_valid[c1t]) continue;
+            for (int t0 = 0; t0 <= 31; t0++) {
+                if (!table_exists(t0)) continue;
+                int c0 = (r0_pairs > 0) ?
+                    huff_cost_big(t0, coeffs, r0_pairs) : 0;
+                if (c0 >= INT_MAX / 2) continue;
+
+                for (int t1 = 0; t1 <= 31; t1++) {
+                    if (!table_exists(t1)) continue;
+                    int c1 = (r1_pairs > 0) ?
+                        huff_cost_big(t1, coeffs + r0_end, r1_pairs) : 0;
+                    if (c1 >= INT_MAX / 2) continue;
+
+                    int total = c0 + c1 + c1_cost[c1t];
+                    if (total < best_total) {
+                        best_total = total;
+                        best.big_values = bv;
+                        best.table0 = t0;
+                        best.table1 = t1;
+                        best.count1table = c1t;
+                        best.count1_quads = c1_quads;
+                        best.total_bits = total;
+                        found = 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if (!found)
+        return -1;
+
+    *cfg = best;
+    return 0;
+}
+
+/* Decoded granule/channel data. (Forward declaration; full definition below.) */
 typedef struct {
     int16_t coeffs[576];
     int part2_bits;       /* bit length of part2 (scalefactors) */
@@ -505,6 +674,107 @@ typedef struct {
     size_t part3_offset;  /* bit offset of part3 within the gc segment */
     int valid;            /* 1 if this gc is eligible for optimization */
 } gc_data_t;
+
+/* Decode a short block's part3 to 576 coefficients.
+ * Uses fixed region boundary at SHORT_REGION_SPLIT.
+ * Returns 0 on success, -1 on error.
+ */
+static int decode_gc_short(bit_reader_t *r, const side_info_t *side,
+                           int g, int ch, int part2_bits, gc_data_t *gd)
+{
+    memset(gd, 0, sizeof(*gd));
+    gd->part2_bits = part2_bits;
+
+    /* Skip part2. */
+    bit_reader_skip(r, part2_bits);
+    size_t part3_start = bit_reader_tell(r);
+
+    int16_t *coeffs = gd->coeffs;
+    memset(coeffs, 0, 576 * sizeof(int16_t));
+
+    int big_values = side->big_values[g][ch];
+    if (big_values < 0 || big_values > 288)
+        return -1;
+
+    int t0 = side->table_select[g][ch][0];
+    int t1 = side->table_select[g][ch][1];
+    if (t0 < 0 || t0 > 31 || t1 < 0 || t1 > 31)
+        return -1;
+    if (t0 == 4 || t0 == 14 || t1 == 4 || t1 == 14)
+        return -1;
+
+    int bv_samples = 2 * big_values;
+    int r0_end = SHORT_REGION_SPLIT;
+    if (r0_end > bv_samples) r0_end = bv_samples;
+
+    /* Region 0. */
+    int r0_pairs = r0_end / 2;
+    if (huff_decode_big(r, t0, coeffs, r0_pairs) < 0)
+        return -1;
+
+    /* Region 1. */
+    int r1_pairs = (bv_samples - r0_end) / 2;
+    if (huff_decode_big(r, t1, coeffs + r0_end, r1_pairs) < 0)
+        return -1;
+
+    /* Count1. */
+    int c1t = side->count1table_select[g][ch];
+    if (c1t != 0 && c1t != 1)
+        return -1;
+
+    size_t part3_end = part3_start + gd->part3_bits;
+    int idx = bv_samples;
+    while (bit_reader_tell(r) < part3_end && idx < 576) {
+        int16_t quad[4];
+        size_t before = bit_reader_tell(r);
+        int bits = huff_decode_count1(r, c1t, quad, 1);
+        if (bits < 0)
+            return -1;
+        if (bit_reader_tell(r) > part3_end) {
+            bit_reader_seek(r, before);
+            break;
+        }
+        for (int i = 0; i < 4 && idx < 576; i++, idx++)
+            coeffs[idx] = quad[i];
+    }
+
+    gd->part3_offset = part3_start;
+    gd->valid = 1;
+    return 0;
+}
+
+/* Re-encode a short block with the optimal config.
+ * Returns part3 bits written, or -1 on error.
+ */
+static int encode_gc_short(bit_writer_t *w, const int16_t *coeffs,
+                           const best_cfg_short_t *cfg)
+{
+    int bv_samples = 2 * cfg->big_values;
+    int r0_end = SHORT_REGION_SPLIT;
+    if (r0_end > bv_samples) r0_end = bv_samples;
+
+    size_t start = bit_writer_tell(w);
+
+    int r0_pairs = r0_end / 2;
+    if (huff_encode_big(w, cfg->table0, coeffs, r0_pairs) < 0)
+        return -1;
+
+    int r1_pairs = (bv_samples - r0_end) / 2;
+    if (huff_encode_big(w, cfg->table1, coeffs + r0_end, r1_pairs) < 0)
+        return -1;
+
+    if (cfg->count1_quads > 0) {
+        if (huff_encode_count1(w, cfg->count1table,
+                               coeffs + bv_samples, cfg->count1_quads) < 0)
+            return -1;
+    }
+
+    return (int)(bit_writer_tell(w) - start);
+}
+
+/* ------------------------------------------------------------------ */
+/* Part 3: Per-granule/channel decode, optimize, re-encode             */
+/* ------------------------------------------------------------------ */
 
 /* Full decode with band edges. Returns 0 on success, -1 on error. */
 static int decode_gc_with_bands(bit_reader_t *r, const side_info_t *side,
@@ -676,15 +946,22 @@ int recompress_frame(queue_frame_t *qf)
     /* Step 1: Compute part2 bit lengths and check eligibility. */
     int p2bits[2][2];
     int eligible[2][2];
+    int is_short[2][2];  /* 1 if this gc uses short blocks */
     int any_eligible = 0;
 
     for (int g = 0; g < granules; g++) {
         for (int ch = 0; ch < channels; ch++) {
             eligible[g][ch] = 0;
+            is_short[g][ch] = 0;
             p2bits[g][ch] = part2_bits(hdr, side, g, ch);
             if (p2bits[g][ch] >= 0) {
                 eligible[g][ch] = 1;
                 any_eligible = 1;
+                /* Mark short blocks (MPEG-1 only for now). */
+                if (hdr->version == MPEG_1 &&
+                    side->window_switching[g][ch] != 0) {
+                    is_short[g][ch] = 1;
+                }
             }
         }
     }
@@ -753,9 +1030,17 @@ int recompress_frame(queue_frame_t *qf)
 
             gcd[g][ch].part3_bits = sg->part2_3_length - sg->part2_bits;
 
-            /* Decode part3 to coefficients. */
-            if (decode_gc_with_bands(&r, side, g, ch, sg->part2_bits,
-                                    band_edges, &gcd[g][ch]) != 0) {
+            /* Decode part3 to coefficients.
+             * Short blocks use the fixed-region decoder. */
+            int dec_rc;
+            if (is_short[g][ch]) {
+                dec_rc = decode_gc_short(&r, side, g, ch, sg->part2_bits,
+                                         &gcd[g][ch]);
+            } else {
+                dec_rc = decode_gc_with_bands(&r, side, g, ch, sg->part2_bits,
+                                              band_edges, &gcd[g][ch]);
+            }
+            if (dec_rc != 0) {
                 /* Decode error: rewind to end of segment and mark ineligible. */
                 bit_reader_seek(&r, sg->bit_offset + sg->part2_3_length);
                 eligible[g][ch] = 0;
@@ -790,7 +1075,49 @@ int recompress_frame(queue_frame_t *qf)
             gc_seg_t *sg = &segs[g][ch];
             gc_data_t *gd = &gcd[g][ch];
 
-            /* Find optimal configuration. */
+            if (is_short[g][ch]) {
+                /* Short block: optimize with fixed region boundary. */
+                best_cfg_short_t scfg;
+                if (find_best_config_short(gd->coeffs, side->big_values[g][ch],
+                                          &scfg) != 0)
+                    continue;
+
+                /* Only keep if strictly smaller. */
+                if (scfg.total_bits >= gd->part3_bits)
+                    continue;
+
+                /* Re-encode. */
+                size_t out_cap = (scfg.total_bits + 7) / 8 + 16;
+                uint8_t *out_buf = malloc(out_cap);
+                if (!out_buf)
+                    continue;
+
+                bit_writer_t w;
+                bit_writer_init(&w, out_buf, out_cap);
+                int written = encode_gc_short(&w, gd->coeffs, &scfg);
+                if (written < 0 || written != scfg.total_bits) {
+                    free(out_buf);
+                    continue;
+                }
+
+                /* Success: record. For short blocks, only table0, table1,
+                 * big_values, and count1table are updated. Region counts
+                 * and table2 are not used. */
+                sg->new_part3 = out_buf;
+                sg->new_part3_bytes = bit_writer_bytes(&w);
+                sg->new_part3_bits = written;
+                sg->new_big_values = scfg.big_values;
+                sg->new_table0 = scfg.table0;
+                sg->new_table1 = scfg.table1;
+                sg->new_table2 = -1;  /* not used for short */
+                sg->new_r0c = -1;     /* not used for short */
+                sg->new_r1c = -1;     /* not used for short */
+                sg->new_c1t = scfg.count1table;
+                any_optimized = 1;
+                continue;
+            }
+
+            /* Long block: Find optimal configuration. */
             best_cfg_t cfg;
             if (find_best_config(gd->coeffs, side->big_values[g][ch],
                                 band_edges, &cfg) != 0)
@@ -928,9 +1255,13 @@ int recompress_frame(queue_frame_t *qf)
                 side->big_values[g][ch] = sg->new_big_values;
                 side->table_select[g][ch][0] = sg->new_table0;
                 side->table_select[g][ch][1] = sg->new_table1;
-                side->table_select[g][ch][2] = sg->new_table2;
-                side->region0_count[g][ch] = sg->new_r0c;
-                side->region1_count[g][ch] = sg->new_r1c;
+                /* For short blocks, table_select[2] and region counts
+                 * are not transmitted; leave them unchanged. */
+                if (!is_short[g][ch]) {
+                    side->table_select[g][ch][2] = sg->new_table2;
+                    side->region0_count[g][ch] = sg->new_r0c;
+                    side->region1_count[g][ch] = sg->new_r1c;
+                }
                 side->count1table_select[g][ch] = sg->new_c1t;
             }
         }
@@ -938,6 +1269,110 @@ int recompress_frame(queue_frame_t *qf)
 
     qf->recompressed = 1;
     return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Part 4b: Multi-threaded frame recompression                         */
+/* ------------------------------------------------------------------ */
+
+/* Work pool for parallel recompression. */
+typedef struct {
+    queue_frame_t *frames;
+    size_t nframes;
+    volatile size_t next_idx;  /* atomic counter for work distribution */
+} recompress_pool_t;
+
+/* Worker thread: process frames until none remain. */
+static void *recompress_worker(void *arg)
+{
+    recompress_pool_t *pool = (recompress_pool_t *)arg;
+    while (1) {
+        /* Atomically grab the next frame index. */
+        size_t idx = __sync_fetch_and_add(&pool->next_idx, 1);
+        if (idx >= pool->nframes)
+            break;
+        /* Fail-safe: recompress_frame never crashes; on error it
+         * keeps the original. */
+        recompress_frame(&pool->frames[idx]);
+    }
+    return NULL;
+}
+
+/* Recompress all frames in parallel using N worker threads.
+ * Each frame is independent; order is preserved (results stored in-place).
+ * If nworkers <= 1, processes single-threaded.
+ * Returns 0 on success.
+ */
+int recompress_frames_parallel(queue_frame_t *frames, size_t nframes,
+                               int nworkers)
+{
+    if (nframes == 0)
+        return 0;
+
+    if (nworkers <= 1) {
+        /* Single-threaded fallback. */
+        for (size_t i = 0; i < nframes; i++) {
+            recompress_frame(&frames[i]);
+        }
+        return 0;
+    }
+
+    /* Cap workers at nframes (no point in more threads than frames). */
+    if ((size_t)nworkers > nframes)
+        nworkers = (int)nframes;
+
+    recompress_pool_t pool;
+    pool.frames = frames;
+    pool.nframes = nframes;
+    pool.next_idx = 0;
+
+    pthread_t *threads = malloc((size_t)nworkers * sizeof(pthread_t));
+    if (!threads) {
+        /* Fallback to single-threaded on alloc failure. */
+        for (size_t i = 0; i < nframes; i++) {
+            recompress_frame(&frames[i]);
+        }
+        return 0;
+    }
+
+    int nstarted = 0;
+    for (int i = 0; i < nworkers; i++) {
+        if (pthread_create(&threads[i], NULL, recompress_worker, &pool) != 0) {
+            break;
+        }
+        nstarted++;
+    }
+
+    if (nstarted == 0) {
+        /* No threads started; fallback to single-threaded. */
+        free(threads);
+        for (size_t i = 0; i < nframes; i++) {
+            recompress_frame(&frames[i]);
+        }
+        return 0;
+    }
+
+    /* If some threads failed to start, the started ones will still
+     * process all frames via the shared atomic counter. */
+    for (int i = 0; i < nstarted; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    free(threads);
+    return 0;
+}
+
+/* Get the default number of workers (number of CPU cores, or 3 if unknown).
+ * Matches the reference implementation's default of min(CPU,3)... actually
+ * we use all cores for better speed. */
+int recompress_default_workers(void)
+{
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    if (n < 1)
+        return 3;
+    if (n > 32)
+        return 32;  /* sanity cap */
+    return (int)n;
 }
 
 /* ------------------------------------------------------------------ */

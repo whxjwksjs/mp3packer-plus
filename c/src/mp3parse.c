@@ -206,7 +206,10 @@ int mp3_find_sync(const uint8_t *data, size_t len, size_t *offset,
             if (data[p] != 0xFF || (data[p+1] & 0xE0) != 0xE0) { ok = 0; break; }
             frame_header_t h2;
             if (mp3_parse_header(data + p, &h2) != 0) { ok = 0; break; }
-            if (!mp3_header_compatible(&h2, &prev, 1)) { ok = 0; break; }
+            /* Use non-strict compat: Xing/Info frames often use plain stereo
+             * while audio uses joint stereo; requiring chan_mode to match
+             * would skip the Xing frame and misalign the leading junk. */
+            if (!mp3_header_compatible(&h2, &prev, 0)) { ok = 0; break; }
             bitrate = mp3_bitrates[h2.version][h2.bitrate_idx];
             sr = mp3_samplerates[h2.version][h2.samplerate_idx];
             fsize = mp3_frame_size(h2.version, bitrate, sr, h2.padding);

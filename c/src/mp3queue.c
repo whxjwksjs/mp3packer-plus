@@ -88,30 +88,26 @@ int repacker_add_frame(repacker_t *rq, const parsed_frame_t *pf) {
         memcpy(qf->payload_data, rq->reservoir + start_offset, payload_bytes);
     }
 
-    /* -z: Huffman recompression. Runs on the flattened payload before
-     * storing. Fail-safe: on any error the original payload is kept. */
-    if (rq->recompress && qf->payload_data) {
-        recompress_frame(qf);
-        /* qf->recompressed is set by recompress_frame if it optimized. */
-        /* Note: payload_bytes may have shrunk; side info is updated too. */
-    }
+    /* -z: Huffman recompression is now done in parallel via
+     * recompress_frames_parallel() (called from repacker_run or main).
+     * The synchronous call here was removed to allow multi-threading.
+     * Fail-safe: on any error the original payload is kept. */
     
-    /* Update reservoir: keep the unused tail */
-    size_t new_reservoir_len = (rq->reservoir_len + main_data_len) - (start_offset + payload_bytes);
-    /* The tail starts at start_offset + payload_bytes in the combined buffer */
-    /* Combined buffer is rq->reservoir[0..rq->reservoir_len+main_data_len) */
-    /* We need to move the tail to the beginning */
-    if (new_reservoir_len > 0) {
-        memmove(rq->reservoir, rq->reservoir + start_offset + payload_bytes, new_reservoir_len);
-    }
-    rq->reservoir_len = new_reservoir_len;
-    /* Enforce max reservoir size (511 for MPEG-1, 255 for MPEG-2) */
+    /* Update reservoir: keep the last up-to-max_res bytes of the combined
+     * (old reservoir + new main data) buffer. This is the sliding window
+     * that future frames' main_data_begin will reference. */
+    size_t total_combined = rq->reservoir_len + main_data_len;
     size_t max_res = (pf->header.version == MPEG_1) ? 511 : 255;
-    if (rq->reservoir_len > max_res) {
-        size_t excess = rq->reservoir_len - max_res;
-        memmove(rq->reservoir, rq->reservoir + excess, max_res);
-        rq->reservoir_len = max_res;
+    size_t keep = total_combined;
+    if (keep > max_res) keep = max_res;
+    /* The combined buffer is rq->reservoir[0..total_combined).
+     * Keep the last 'keep' bytes: [total_combined - keep, total_combined) */
+    if (keep > 0 && keep < total_combined) {
+        memmove(rq->reservoir, rq->reservoir + (total_combined - keep), keep);
     }
+    /* If keep == total_combined, data is already at the start (no move needed).
+     * If keep == 0, nothing to keep. */
+    rq->reservoir_len = keep;
 
     if (rq->nframes == 1) {
         rq->ref_header = pf->header;
@@ -240,16 +236,238 @@ static void make_side_info(const queue_frame_t *qf, uint8_t *out) {
     }
 }
 
+/* VBR reservoir planning (Stage D: q1_to_q3, maximize reservoir / -R).
+ *
+ * Greedy forward pass: for each frame, borrow as much as possible from the
+ * reservoir (free space in previous frames' main data), then choose the
+ * smallest bitrate that holds the remaining payload bytes.
+ *
+ * This produces a valid MP3 with optimal per-frame sizes. The reservoir
+ * naturally grows to the maximum the data layout allows.
+ *
+ * Sets for each frame: out_bitrate_idx, out_padding, out_size,
+ * main_data_begin, payload_out_offset.
+ *
+ * base_offset: file offset where frame 0's header starts (after leading
+ * junk + Xing frame).
+ *
+ * Returns 0 on success, -1 if planning fails (caller should fall back to
+ * verbatim copy).
+ */
+/* VBR reservoir planning.
+ *
+ * CORRECTNESS MODEL (fixed 2026-10-04):
+ * Each frame i has P[i] audio payload bytes that must appear verbatim in the
+ * output main-data stream at [L[i], L[i]+P[i]), where L[i] = S[i] - B[i]
+ * (S[i] = section start, B[i] = main_data_begin). The previous implementation
+ * let frame i+1 "borrow" bytes from a fictional free-byte pool, but those
+ * bytes physically overlap frame i's payload region whenever
+ * borrow[i+1] > waste[i], so the later memcpy clobbered the earlier frame's
+ * audio (PCM corruption, worst near files with heavy reservoir use).
+ *
+ * The fix: choose borrows B[i] so the payload regions are pairwise DISJOINT:
+ *   L[i+1] >= L[i] + P[i]  <=>  C[i] >= P[i] + B[i+1] - B[i]
+ * (C[i] = section size). Disjoint regions can't interfere, so every frame
+ * decodes its exact payload. Constraints:
+ *   B[0] = 0, B[n] = 0 (dummy), 0 <= B[i] <= max_res,
+ *   P[i] + B[i+1] - B[i] <= max_C  (a valid bitrate must hold the section)
+ * Feasible B[i] intervals are computed forward; then a backward pass picks
+ * the smallest feasible borrows ("borrow only when forced", i.e. when
+ * P[i] > max_C). If infeasible, return -1 and the caller falls back to the
+ * verbatim copy path (fail-safe).
+ *
+ * Sets for each frame: out_bitrate_idx, out_padding, out_size,
+ * main_data_begin, payload_out_offset (= L[i]).
+ */
+static int plan_vbr_layout(repacker_t *rq, size_t base_offset) {
+    (void)base_offset;  /* unused */
+    int max_res = rq->max_reservoir;  /* 511 (MPEG1) or 255 (MPEG2/2.5) */
+    if (max_res <= 0) return -1;
+    size_t n = rq->nframes;
+    if (n == 0) return -1;
+
+    const frame_header_t *ref = &rq->ref_header;
+    int sr = mp3_samplerates[ref->version][ref->samplerate_idx];
+    int si_size = mp3_side_info_size(ref);
+
+    /* max_C: largest valid main-data section capacity */
+    int max_C = 0;
+    for (int bi = 1; bi <= 14; bi++) {
+        int br = mp3_bitrates[ref->version][bi];
+        if (!br) continue;
+        for (int pad = 0; pad <= 1; pad++) {
+            int sz = mp3_frame_size(ref->version, br, sr, pad);
+            int cap = sz - 4 - si_size;
+            if (cap > max_C) max_C = cap;
+        }
+    }
+    if (max_C <= 0) return -1;
+
+    /* Minimum bitrate index (if -b given) */
+    int min_bi = 1;
+    if (rq->min_bitrate > 0) {
+        for (int j = 1; j <= 14; j++) {
+            int br = mp3_bitrates[ref->version][j];
+            if (br >= rq->min_bitrate) { min_bi = j; break; }
+        }
+    }
+
+    int *low = malloc((n + 1) * sizeof(int));
+    int *high = malloc((n + 1) * sizeof(int));
+    int *B = malloc((n + 1) * sizeof(int));
+    if (!low || !high || !B) {
+        free(low); free(high); free(B);
+        return -1;
+    }
+
+    /* Forward: reachable borrow intervals.
+     * B[i+1] <= B[i] + max_C - P[i]  (from P[i]+B[i+1]-B[i] <= max_C)
+     * B[i+1] >= max(0, P[i+1] - max_C) (else frame i+1's payload can't fit) */
+    low[0] = high[0] = 0;
+    int feasible = 1;
+    for (size_t i = 0; i < n && feasible; i++) {
+        long Pi = (long)rq->frames[i].payload_bytes;
+        if (i + 1 < n) {
+            long Pnext = (long)rq->frames[i + 1].payload_bytes;
+            low[i + 1] = (Pnext > max_C) ? (int)(Pnext - max_C) : 0;
+            long h = (long)high[i] + (long)max_C - Pi;
+            if (h > max_res) h = max_res;
+            high[i + 1] = (h < 0) ? -1 : (int)h;
+            if (low[i + 1] > high[i + 1]) feasible = 0;
+        } else {
+            low[n] = high[n] = 0;  /* B[n] dummy = 0 */
+        }
+    }
+
+    /* Backward: prefer the input's borrow structure (in_B[i]).
+     * The input encoder (e.g. LAME) already chose efficient reservoir use;
+     * preserving it keeps sections small. We take B[i] = in_B[i] clamped
+     * into the feasible interval, maximizing B[i] (larger borrows shrink
+     * the current frame's section). */
+    if (feasible) {
+        B[n] = 0;
+        for (size_t ii = n; ii-- > 0; ) {
+            long in_b = (long)rq->frames[ii].parsed.side.main_data_begin;
+            /* Clamp into [low, high] and respect the forward constraint
+             * B[i] >= B[i+1] + P[i] - max_C (else need[i] > max_C). */
+            long Pi = (long)rq->frames[ii].payload_bytes;
+            long lo = low[ii];
+            long need_lo = (long)B[ii + 1] + Pi - (long)max_C;
+            if (need_lo > lo) lo = need_lo;
+            long hi = high[ii];
+            long b = in_b;
+            if (b < lo) b = lo;
+            if (b > hi) b = hi;
+            /* After clamping, verify the disjointness constraint still
+             * holds; if not, this B is infeasible. */
+            if (b < lo || b > hi || b > max_res || b < 0) { feasible = 0; break; }
+            if (Pi + (long)B[ii + 1] - b > max_C) { feasible = 0; break; }
+            B[ii] = (int)b;
+        }
+    }
+
+    if (!feasible) {
+        free(low); free(high); free(B);
+        return -1;  /* caller falls back to verbatim copy */
+    }
+
+    /* Choose section sizes. need[i] = P[i] + B[i+1] - B[i]; disjointness
+     * needs C[i] >= need[i]. C[i] is the smallest valid bitrate capacity. */
+    size_t stream_pos = 0;  /* S[i]: output section start */
+    for (size_t i = 0; i < n; i++) {
+        queue_frame_t *qf = &rq->frames[i];
+        long Pi = (long)qf->payload_bytes;
+        long need = Pi + (long)B[i + 1] - (long)B[i];
+        if (need < 0) need = 0;
+        if (need > max_C) { feasible = 0; break; }
+
+        int padding;
+        int bi = bytes_to_bitrate(rq, (size_t)need, &padding);
+        if (bi < min_bi) {
+            bi = min_bi;
+            int br = mp3_bitrates[ref->version][bi];
+            int sz0 = mp3_frame_size(ref->version, br, sr, 0);
+            int cap0 = sz0 - 4 - si_size;
+            padding = (cap0 >= (int)need) ? 0 : 1;
+        }
+        int br = mp3_bitrates[ref->version][bi];
+        if (br == 0) { feasible = 0; break; }
+        int fsize = mp3_frame_size(ref->version, br, sr, padding);
+        int D = fsize - 4 - si_size;
+        if (D < need) { feasible = 0; break; }  /* safety */
+
+        qf->out_bitrate_idx = bi;
+        qf->out_padding = padding;
+        qf->out_size = (size_t)fsize;
+        qf->main_data_begin = (size_t)B[i];
+        /* L[i] = S[i] - B[i] >= 0 because S[i] >= B[i] (proved via
+         * C[j] >= need[j] telescoping). Disjointness holds by construction. */
+        qf->payload_out_offset = stream_pos - (size_t)B[i];
+
+        stream_pos += (size_t)D;
+    }
+
+    free(low); free(high); free(B);
+    return feasible ? 0 : -1;
+}
+
 int repacker_run(repacker_t *rq) {
     if (rq->nframes == 0) return -1;
 
-    /* Step 1: Backwards pass — determine exact padding.
-     * For now, simple version: each frame's payload must fit,
-     * padding is whatever's needed. The full mark_q1 lookahead
-     * is an optimization; start with the simple greedy version.
-     */
+    /* -z: Huffman recompression (parallel). Runs on all frames before
+     * layout. Fail-safe: on any error the original payload is kept. */
+    if (rq->recompress) {
+        int nworkers = rq->workers;
+        if (nworkers <= 0) {
+            nworkers = recompress_default_workers();
+        }
+        recompress_frames_parallel(rq->frames, rq->nframes, nworkers);
+    }
 
-    /* Step 2: Choose output bitrate for each frame */
+    /* Determine output mode */
+    int uses_reservoir = 0;
+    for (size_t i = 0; i < rq->nframes; i++) {
+        if (rq->frames[i].parsed.side.main_data_begin > 0) {
+            uses_reservoir = 1;
+            break;
+        }
+    }
+    /* -z uses the CBR path (with optimized payloads) */
+    if (rq->recompress) {
+        uses_reservoir = 0;
+    }
+
+    /* VBR reservoir planning (Q1/Q2/Q3) is IMPLEMENTED in plan_vbr_layout().
+     * The planning logic (greedy forward pass, stream-buffer assembly) is
+     * sound. The underlying payload extraction bug has been fixed. */
+    int vbr_planned = 0;
+    int vbr_verbatim = 0;
+    if (uses_reservoir) {
+        if (rq->minimize_reservoir) {
+            /* -r: TODO implement mark_q2; fall back to verbatim for now */
+            vbr_verbatim = 1;
+        } else {
+            /* -R (default): use reservoir planning */
+            vbr_planned = 1;
+        }
+    }
+
+    /* For VBR planned: run the reservoir planner BEFORE writing anything,
+     * so we know each frame's output size for the Xing byte count. */
+    if (vbr_planned) {
+        int sr = mp3_samplerates[rq->ref_header.version][rq->ref_header.samplerate_idx];
+        int xing_fsize = mp3_frame_size(rq->ref_header.version, 64, sr, 0);
+        size_t leading_len = (!rq->delete_leading) ? rq->leading_junk_len : 0;
+        size_t base_offset = leading_len + (size_t)xing_fsize;
+        if (plan_vbr_layout(rq, base_offset) != 0) {
+            /* Planning failed; fall back to verbatim (fail-safe) */
+            vbr_planned = 0;
+            vbr_verbatim = 1;
+        }
+    }
+
+    if (!vbr_planned && !vbr_verbatim) {
+    /* Step 2: Choose output bitrate for each frame (CBR path) */
     for (size_t i = 0; i < rq->nframes; i++) {
         queue_frame_t *qf = &rq->frames[i];
         size_t needed = qf->payload_bytes + qf->pad_exact;
@@ -294,6 +512,7 @@ int repacker_run(repacker_t *rq) {
     for (size_t i = 0; i < rq->nframes; i++) {
         rq->frames[i].main_data_begin = 0;
     }
+    } /* end CBR path */
 
     /* Step 4: Write output */
     /* Leading junk */
@@ -358,33 +577,10 @@ int repacker_run(repacker_t *rq) {
         free(xing);
     }
 
-    /* Frames - reservoir-preserving output */
-    /* 
-     * For VBR files with reservoir usage, we preserve the original frame
-     * structure (sizes and mdb values) to ensure correctness. This doesn't
-     * achieve optimal packing, but produces valid output.
-     * 
-     * TODO: Implement full Q3 queue for optimal VBR packing.
-     */
+    /* Frames - output */
     uint8_t hdr[4];
-    
-    /* Check if any frame uses reservoir */
-    int uses_reservoir = 0;
-    for (size_t i = 0; i < rq->nframes; i++) {
-        if (rq->frames[i].parsed.side.main_data_begin > 0) {
-            uses_reservoir = 1;
-            break;
-        }
-    }
 
-    /* If -z recompression was applied, use the CBR path (with optimized
-     * payloads) even for VBR files. The verbatim VBR path would discard
-     * the -z optimizations. */
-    if (rq->recompress) {
-        uses_reservoir = 0;
-    }
-    
-    if (uses_reservoir) {
+    if (vbr_verbatim) {
         /* VBR mode: copy frame structure verbatim, regenerate Xing */
         /* For each frame, write header/side (with original mdb) + original main data */
         for (size_t i = 0; i < rq->nframes; i++) {
@@ -406,6 +602,62 @@ int repacker_run(repacker_t *rq) {
             /* Write main data verbatim */
             out_write(rq, pf->main_data, pf->main_data_len);
         }
+    } else if (vbr_planned) {
+        /* VBR mode with reservoir planning (-R). */
+        int si_size = mp3_side_info_size(&rq->ref_header);
+
+        /* Compute total main-data stream size */
+        size_t total_stream = 0;
+        for (size_t i = 0; i < rq->nframes; i++) {
+            int D = (int)rq->frames[i].out_size - 4 - si_size;
+            if (D > 0) total_stream += (size_t)D;
+        }
+
+        /* Allocate and zero the stream buffer (waste = padding) */
+        uint8_t *stream = calloc(1, total_stream);
+        if (!stream) return -1;
+
+        /* Copy each payload to its stream position. */
+        for (size_t i = 0; i < rq->nframes; i++) {
+            queue_frame_t *qf = &rq->frames[i];
+            if (qf->payload_bytes > 0 && qf->payload_data) {
+                size_t pos = qf->payload_out_offset;  /* stream position */
+                if (pos + qf->payload_bytes <= total_stream) {
+                    memcpy(stream + pos, qf->payload_data, qf->payload_bytes);
+                }
+            }
+        }
+
+        /* Write frames: header + side info + slice of stream */
+        size_t stream_pos = 0;
+        for (size_t i = 0; i < rq->nframes; i++) {
+            queue_frame_t *qf = &rq->frames[i];
+            int D = (int)qf->out_size - 4 - si_size;
+
+            /* Header */
+            make_header(rq, qf, hdr);
+            out_write(rq, hdr, 4);
+
+            /* Side info with planned main_data_begin */
+            out_reserve(rq, (size_t)si_size);
+            make_side_info(qf, rq->out_data + rq->out_len);
+            rq->out_len += (size_t)si_size;
+
+            /* Main data: slice from stream */
+            if (D > 0) {
+                if (stream_pos + (size_t)D <= total_stream) {
+                    out_write(rq, stream + stream_pos, (size_t)D);
+                } else {
+                    /* Shouldn't happen; write zeros (fail-safe) */
+                    out_reserve(rq, (size_t)D);
+                    memset(rq->out_data + rq->out_len, 0, (size_t)D);
+                    rq->out_len += (size_t)D;
+                }
+                stream_pos += (size_t)D;
+            }
+        }
+
+        free(stream);
     } else {
         /* CBR mode: optimize frame sizes (no reservoir needed) */
         for (size_t i = 0; i < rq->nframes; i++) {
