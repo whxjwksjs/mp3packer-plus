@@ -1,0 +1,60 @@
+name: Windows x64 Build
+
+on:
+  push:
+    paths:
+      - 'c/**'
+      - '.github/workflows/windows-x64.yml'
+  pull_request:
+    paths:
+      - 'c/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup MinGW
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-make
+      
+      - name: Build CLI
+        shell: msys2 {0}
+        run: |
+          cd c/src
+          gcc -O2 -std=c99 -Wall -Wextra \
+            -o mp3packer-cli.exe \
+            mp3bit.c mp3crc.c mp3tables.c mp3parse.c mp3huffman.c mp3queue.c main.c
+      
+      - name: Build GUI
+        shell: msys2 {0}
+        run: |
+          cd c/src
+          gcc -O2 -std=c99 -Wall -Wextra -mwindows \
+            -o mp3packer-gui.exe \
+            mp3bit.c mp3crc.c mp3tables.c mp3parse.c mp3huffman.c mp3queue.c gui_main.c \
+            -lgdi32 -lcomdlg32
+      
+      - name: Verify binaries
+        shell: msys2 {0}
+        run: |
+          cd c/src
+          file mp3packer-cli.exe mp3packer-gui.exe
+          ls -la *.exe
+      
+      - name: Upload CLI
+        uses: actions/upload-artifact@v4
+        with:
+          name: mp3packer-windows-x64-cli
+          path: c/src/mp3packer-cli.exe
+      
+      - name: Upload GUI
+        uses: actions/upload-artifact@v4
+        with:
+          name: mp3packer-windows-x64-gui
+          path: c/src/mp3packer-gui.exe
