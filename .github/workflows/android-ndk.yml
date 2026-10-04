@@ -43,7 +43,7 @@ jobs:
         run: |
           cd c/src
           $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.triple }}-clang \
-            -O2 -std=c99 -Wall -Wextra \
+            -O2 -std=c99 -Wall -Wextra -pthread \
             -o ${{ matrix.artifact }} \
             mp3bit.c mp3crc.c mp3tables.c mp3parse.c mp3huffman.c mp3queue.c mp3recomp.c main.c
           # Verify it's a valid ELF for the target ABI
