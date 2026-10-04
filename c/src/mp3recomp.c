@@ -44,7 +44,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 
 #include "mp3recomp.h"
 #include "mp3huffman.h"
@@ -1367,7 +1371,13 @@ int recompress_frames_parallel(queue_frame_t *frames, size_t nframes,
  * we use all cores for better speed. */
 int recompress_default_workers(void)
 {
+#ifdef _WIN32
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    long n = (long)si.dwNumberOfProcessors;
+#else
     long n = sysconf(_SC_NPROCESSORS_ONLN);
+#endif
     if (n < 1)
         return 3;
     if (n > 32)
