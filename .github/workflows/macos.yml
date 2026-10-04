@@ -1,0 +1,41 @@
+name: macOS Build
+
+on:
+  push:
+    paths:
+      - 'c/**'
+      - '.github/workflows/macos.yml'
+  pull_request:
+    paths:
+      - 'c/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+            artifact: mp3packer-macos-arm64-cli
+          - runner: macos-13
+            arch: x64
+            artifact: mp3packer-macos-x64-cli
+    runs-on: ${{ matrix.runner }}
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Build CLI
+        run: |
+          cd c/src
+          cc -O2 -std=c99 -Wall -Wextra \
+            -o ${{ matrix.artifact }} \
+            mp3bit.c mp3crc.c mp3tables.c mp3parse.c mp3huffman.c mp3queue.c main.c
+          file ${{ matrix.artifact }}
+      
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: c/src/${{ matrix.artifact }}
