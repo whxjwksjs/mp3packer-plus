@@ -1,5 +1,6 @@
 name: macOS Build
 
+
 on:
   push:
     paths:
@@ -9,6 +10,7 @@ on:
     paths:
       - 'c/**'
   workflow_dispatch:
+
 
 jobs:
   build:
@@ -31,7 +33,7 @@ jobs:
           cd c/src
           cc -O2 -std=c99 -Wall -Wextra \
             -o ${{ matrix.artifact }} \
-            mp3bit.c mp3crc.c mp3tables.c mp3parse.c mp3huffman.c mp3queue.c main.c
+            mp3bit.c mp3crc.c mp3tables.c mp3parse.c mp3huffman.c mp3queue.c mp3recomp.c main.c
           file ${{ matrix.artifact }}
       
       - name: Upload
