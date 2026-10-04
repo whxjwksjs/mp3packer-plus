@@ -1,0 +1,41 @@
+(executable
+ (name mp3packer)
+ (modules
+  types
+  p
+  pack
+  crc
+  list2
+  expandarray
+  unicode
+  ptr
+  threadpool
+  mp3framehuffman
+  mp3frameutils
+  mp3read
+  mp3write
+  mp3info
+  mp3queue
+  mp3packer)
+ (libraries unix threads str)
+
+ (foreign_stubs
+  (language c)
+  (names
+   c_part
+   ptr-c
+   unicode-c
+   mp3framehuffman-c
+   mp3frameutils-c)
+  
+  (flags :standard (:include flags.sexp))
+ )
+ 
+ (flags (:standard -warn-error -a)))
+
+(rule
+ (targets flags.sexp)
+
+ (deps (:discover discover/discover.exe))
+ 
+ (action (run %{discover})))
