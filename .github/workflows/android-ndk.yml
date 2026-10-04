@@ -1,0 +1,54 @@
+name: Android NDK Build
+
+on:
+  push:
+    paths:
+      - 'c/**'
+      - '.github/workflows/android-ndk.yml'
+  pull_request:
+    paths:
+      - 'c/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - abi: armeabi-v7a
+            triple: armv7a-linux-androideabi21
+            artifact: mp3packer-android-arm32
+          - abi: arm64-v8a
+            triple: aarch64-linux-android21
+            artifact: mp3packer-android-arm64
+          - abi: x86
+            triple: i686-linux-android21
+            artifact: mp3packer-android-x86
+          - abi: x86_64
+            triple: x86_64-linux-android21
+            artifact: mp3packer-android-x64
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+      
+      - name: Build for ${{ matrix.abi }}
+        run: |
+          cd c/src
+          $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.triple }}-clang \
+            -O2 -std=c99 -Wall -Wextra \
+            -o ${{ matrix.artifact }} \
+            mp3bit.c mp3crc.c mp3tables.c mp3parse.c mp3huffman.c mp3queue.c main.c
+          # Verify it's a valid ELF for the target ABI
+          file ${{ matrix.artifact }}
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: c/src/${{ matrix.artifact }}
