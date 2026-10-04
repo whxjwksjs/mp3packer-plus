@@ -30,9 +30,21 @@ LRESULT nk_gdi_handle_event(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam,
 #include <string.h>
 
 struct GdiFont {
+    struct nk_user_font nk;
     HFONT handle;
     int height;
 };
+
+static float nk_gdi_font_width(nk_handle handle, float height,
+                               const char *text, int len) {
+    GdiFont *font = (GdiFont*)handle.ptr;
+    if (!text || len <= 0) return 0;
+    SIZE size;
+    /* Convert UTF-8 to wide for measurement - simple ASCII path */
+    if (GetTextExtentPoint32A(g_gdi.memdc, text, len, &size))
+        return (float)size.cx;
+    return (float)(len * font->height / 2);
+}
 
 static struct {
     HWND hwnd;
@@ -87,8 +99,11 @@ HWND nk_gdi_create_window(HINSTANCE hInstance, const char *title,
     if (!g_gdi.font.handle)
         g_gdi.font.handle = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
     g_gdi.font.height = 16;
+    g_gdi.font.nk.userdata = nk_handle_ptr(&g_gdi.font);
+    g_gdi.font.nk.height = 16;
+    g_gdi.font.nk.width = nk_gdi_font_width;
     
-    nk_init_default(&g_gdi.ctx, &g_gdi.font.handle);
+    nk_init_default(&g_gdi.ctx, &g_gdi.font.nk);
     nk_buffer_init_default(&g_gdi.cmds);
     
     *font = &g_gdi.font;
