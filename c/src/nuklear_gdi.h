@@ -37,13 +37,21 @@ struct GdiFont {
 
 static float nk_gdi_font_width(nk_handle handle, float height,
                                const char *text, int len) {
-    GdiFont *font = (GdiFont*)handle.ptr;
+    (void)height;
     if (!text || len <= 0) return 0;
+    GdiFont *font = (GdiFont*)handle.ptr;
+    /* Use screen DC for measurement */
+    HDC hdc = GetDC(NULL);
+    HFONT old = NULL;
+    if (font && font->handle)
+        old = SelectObject(hdc, font->handle);
     SIZE size;
-    /* Convert UTF-8 to wide for measurement - simple ASCII path */
-    if (GetTextExtentPoint32A(g_gdi.memdc, text, len, &size))
-        return (float)size.cx;
-    return (float)(len * font->height / 2);
+    float w = 0;
+    if (GetTextExtentPoint32A(hdc, text, len, &size))
+        w = (float)size.cx;
+    if (old) SelectObject(hdc, old);
+    ReleaseDC(NULL, hdc);
+    return w;
 }
 
 static struct {
