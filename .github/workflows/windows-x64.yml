@@ -1,5 +1,6 @@
 name: Windows x64 Build
 
+
 on:
   push:
     paths:
@@ -9,6 +10,7 @@ on:
     paths:
       - 'c/**'
   workflow_dispatch:
+
 
 jobs:
   build:
@@ -29,7 +31,7 @@ jobs:
           cd c/src
           gcc -O2 -std=c99 -Wall -Wextra \
             -o mp3packer-cli.exe \
-            mp3bit.c mp3crc.c mp3tables.c mp3parse.c mp3huffman.c mp3queue.c main.c
+            mp3bit.c mp3crc.c mp3tables.c mp3parse.c mp3huffman.c mp3queue.c mp3recomp.c main.c
       
       - name: Build GUI
         shell: msys2 {0}
@@ -39,7 +41,7 @@ jobs:
           curl -sL -o nuklear.h https://raw.githubusercontent.com/Immediate-Mode-UI/Nuklear/master/nuklear.h
           gcc -O2 -std=c99 -Wall -Wextra -mwindows \
             -o mp3packer-gui.exe \
-            mp3bit.c mp3crc.c mp3tables.c mp3parse.c mp3huffman.c mp3queue.c gui_main.c \
+            mp3bit.c mp3crc.c mp3tables.c mp3parse.c mp3huffman.c mp3queue.c mp3recomp.c gui_main.c \
             -lgdi32 -lcomdlg32
       
       - name: Verify binaries
