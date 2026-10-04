@@ -29,7 +29,7 @@ jobs:
         shell: msys2 {0}
         run: |
           cd c/src
-          gcc -O2 -std=c99 -Wall -Wextra \
+          gcc -O2 -std=c99 -Wall -Wextra -pthread \
             -o mp3packer-cli.exe \
             mp3bit.c mp3crc.c mp3tables.c mp3parse.c mp3huffman.c mp3queue.c mp3recomp.c main.c
       
@@ -39,7 +39,7 @@ jobs:
           cd c/src
           # Download Nuklear (single-header GUI library, 1.1MB)
           curl -sL -o nuklear.h https://raw.githubusercontent.com/Immediate-Mode-UI/Nuklear/master/nuklear.h
-          gcc -O2 -std=c99 -Wall -Wextra -mwindows \
+          gcc -O2 -std=c99 -Wall -Wextra -mwindows -pthread \
             -o mp3packer-gui.exe \
             mp3bit.c mp3crc.c mp3tables.c mp3parse.c mp3huffman.c mp3queue.c mp3recomp.c gui_main.c \
             -lgdi32 -lcomdlg32
