@@ -14,6 +14,7 @@ typedef struct {
     int out_padding;          /* chosen output padding bit */
     size_t out_size;          /* total output frame size in bytes */
     size_t main_data_begin;   /* output reservoir offset */
+    int recompressed;         /* -z: payload/side info were Huffman-optimized */
 } queue_frame_t;
 
 /* Repacker state */
@@ -29,6 +30,7 @@ typedef struct {
     /* config */
     int min_bitrate;          /* kbps, 0 = none */
     int minimize_reservoir;   /* -r flag */
+    int recompress;           /* -z flag: Huffman recompression */
 
     /* reservoir */
     int max_reservoir;        /* 511 (MPEG1) or 255 (MPEG2/2.5) */

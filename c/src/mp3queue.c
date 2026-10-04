@@ -1,6 +1,7 @@
 #include "mp3queue.h"
 #include "mp3tables.h"
 #include "mp3bit.h"
+#include "mp3recomp.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -85,6 +86,14 @@ int repacker_add_frame(repacker_t *rq, const parsed_frame_t *pf) {
         qf->payload_data = malloc(payload_bytes);
         if (!qf->payload_data) return -1;
         memcpy(qf->payload_data, rq->reservoir + start_offset, payload_bytes);
+    }
+
+    /* -z: Huffman recompression. Runs on the flattened payload before
+     * storing. Fail-safe: on any error the original payload is kept. */
+    if (rq->recompress && qf->payload_data) {
+        recompress_frame(qf);
+        /* qf->recompressed is set by recompress_frame if it optimized. */
+        /* Note: payload_bytes may have shrunk; side info is updated too. */
     }
     
     /* Update reservoir: keep the unused tail */
@@ -196,11 +205,20 @@ static void make_header(const repacker_t *rq, const queue_frame_t *qf,
 }
 
 /* Write side info with updated main_data_begin.
- * Copies the input side info bytes and patches main_data_begin.
+ * For -z recompressed frames, serializes from the updated side_info_t.
+ * Otherwise copies the input side info bytes and patches main_data_begin.
  */
 static void make_side_info(const queue_frame_t *qf, uint8_t *out) {
     const parsed_frame_t *pf = &qf->parsed;
     int si_size = mp3_side_info_size(&pf->header);
+
+    if (qf->recompressed) {
+        /* -z: side info fields (tables, regions, part2_3_length, big_values)
+         * were updated by the optimizer; serialize from the struct. */
+        write_side_info_bytes(&pf->header, &pf->side,
+                              (int)qf->main_data_begin, out);
+        return;
+    }
 
     /* Copy original side info */
     size_t si_offset = 4 + (pf->header.protection == 0 ? 2 : 0);
@@ -357,6 +375,13 @@ int repacker_run(repacker_t *rq) {
             uses_reservoir = 1;
             break;
         }
+    }
+
+    /* If -z recompression was applied, use the CBR path (with optimized
+     * payloads) even for VBR files. The verbatim VBR path would discard
+     * the -z optimizations. */
+    if (rq->recompress) {
+        uses_reservoir = 0;
     }
     
     if (uses_reservoir) {

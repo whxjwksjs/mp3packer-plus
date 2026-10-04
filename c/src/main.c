@@ -14,7 +14,7 @@ void print_usage(const char *prog) {
     printf("  -s      Strip trailing junk (ID3v1/APEv2)\n");
     printf("  -r      Minimize bit reservoir\n");
     printf("  -R      Maximize bit reservoir (default)\n");
-    printf("  -z      Recompress (not yet implemented)\n");
+    printf("  -z      Recompress Huffman data (lossless, slower)\n");
     printf("  -i      Info only\n");
     printf("  -f      Force overwrite\n");
     printf("  -h      This help\n");
@@ -89,7 +89,7 @@ int main(int argc, char **argv) {
         opts.out_path = argv[i];
 
     if (opts.recompress) {
-        fprintf(stderr, "Note: -z recompression not yet implemented, ignoring\n");
+        printf("Recompression (-z) enabled\n");
     }
 
     /* Read input */
@@ -139,6 +139,7 @@ int main(int argc, char **argv) {
     rq.in_len = in_len;
     rq.min_bitrate = opts.min_bitrate;
     rq.minimize_reservoir = opts.minimize_reservoir;
+    rq.recompress = opts.recompress;
     rq.delete_leading = opts.delete_begin;
     rq.delete_trailing = opts.delete_end;
 
