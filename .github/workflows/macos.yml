@@ -31,7 +31,7 @@ jobs:
       - name: Build CLI
         run: |
           cd c/src
-          cc -O2 -std=c99 -Wall -Wextra \
+          cc -O2 -std=c99 -Wall -Wextra -pthread \
             -o ${{ matrix.artifact }} \
             mp3bit.c mp3crc.c mp3tables.c mp3parse.c mp3huffman.c mp3queue.c mp3recomp.c main.c
           file ${{ matrix.artifact }}
