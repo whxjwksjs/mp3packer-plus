@@ -15,7 +15,7 @@ on:
 jobs:
   build:
     strategy:
-      matrix:macos-13
+      matrix:
         include:
           - runner: macos-14
             arch: arm64
